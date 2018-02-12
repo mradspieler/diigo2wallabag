@@ -1,0 +1,8 @@
+# Configuration
+
+[settings]
+host = "https://wallabag.example.com"
+clientID = "4_45n94akdgr0g48oo0c4kok0ss0owk4kgco008gg"
+clientSecret = "2zsxt0g8g4w4ccck8ssok48kcosgkgwgwk8"
+username = "max"
+password = "musterman"
