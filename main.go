@@ -36,7 +36,6 @@ type respData struct {
 }
 
 var (
-	// wg           sync.WaitGroup
 	clientID     string
 	clientSecret string
 	userName     string
@@ -88,19 +87,25 @@ func main() {
 	}
 
 	defer resp.Body.Close()
+
 	accessTokTime := time.Now().UnixNano()
 
 	var rd respData
 	byteData, err := ioutil.ReadAll(resp.Body)
 	json.Unmarshal(byteData, &rd)
 
-	fmt.Printf("accessTokTime: %#v\n\n", accessTokTime)
+	concurrency := 2
+	sem := make(chan bool, concurrency)
 
 	for _, s := range ds[1:] {
-		// 	// wg.Add(1)
-		checkURL(s, rd.AccessToken)
+		sem <- true
+
+		go checkURL(sem, s, rd.AccessToken)
 
 		if ((time.Now().UnixNano() - accessTokTime) / 1000000000.0) > 3500 {
+			for i := 0; i < cap(sem); i++ {
+				sem <- true
+			}
 			resp, err := http.PostForm(hostName+"/oauth/v2/token", url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "client_secret": {clientSecret}, "refresh_token": {rd.RefreshToken}})
 			if err != nil {
 				log.Fatalf("Error: %#v\n", err)
@@ -109,27 +114,18 @@ func main() {
 
 			byteData, err := ioutil.ReadAll(resp.Body)
 			json.Unmarshal(byteData, &rd)
-
-			// fmt.Printf("\nNew AccessToken: %#v\n", rd.AccessToken)
-			// fmt.Printf("ExpiresIn: %#v\n", rd.ExpiresIn)
-			// fmt.Printf("RefreshToken: %#v\n", rd.RefreshToken)
-			// fmt.Printf("Scope: %#v\n\n", rd.Scope)
-
 		}
 	}
+	for i := 0; i < cap(sem); i++ {
+		sem <- true
+	}
 
-	// Wait for all HTTP fetches to complete.
-	// wg.Wait()
 	fmt.Printf("Links OK: %d\n", foundLinks)
-	fmt.Printf("\nDuration: %#.4v min.\n", float64((time.Now().UnixNano()-startTime)/1000000000.0)/60.0)
+	fmt.Printf("\nDuration: %#.4v min.\n", float64((time.Now().UnixNano()-startTime)/1000000000.0)/60)
 }
 
-func checkURL(u diigoCsv, token string) {
-	// defer wg.Done()
-
-	// c := &http.Client{
-	// 	Timeout: 10 * time.Second,
-	// }
+func checkURL(s chan bool, u diigoCsv, token string) {
+	defer func() { <-s }()
 
 	resp, err := http.Get(u.url)
 	if err != nil {
