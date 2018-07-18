@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/csv"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -15,7 +14,7 @@ import (
 	"runtime/pprof"
 	"runtime/trace"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/spf13/viper"
@@ -29,6 +28,9 @@ type diigoCsv struct {
 	comments    string
 	annotations string
 	createdAt   string
+	checkResp    int
+	insertResp    int
+	workN    int
 }
 
 type respData struct {
@@ -45,7 +47,6 @@ var (
 	userName     string
 	password     string
 	hostName     string
-	workCounter  int32
 )
 
 func initEnv() {
@@ -75,7 +76,7 @@ func main() {
 
 	initEnv()
 
-	concurrencyPtr := flag.Int("t", 1, "how many threads startet")
+	concurrencyPtr := flag.Int("t", 1, "how many goroutines startet")
 	debugPtr := flag.Bool("d", false, "write debug files")
 
 	flag.Parse()
@@ -99,8 +100,8 @@ func main() {
 		checkerr(err)
 	}
 
-	ds := createData(f)
-	fmt.Printf("Entries: %d\n", len(ds))
+	in := genData(f)
+	fmt.Printf("Entries: %d\n", len(in))
 
 	clientID = viper.GetString("settings.clientID")
 	clientSecret = viper.GetString("settings.clientSecret")
@@ -108,66 +109,181 @@ func main() {
 	password = viper.GetString("settings.password")
 	hostName = viper.GetString("settings.host")
 
-	resp, err := http.PostForm(hostName+"/oauth/v2/token",
-		url.Values{"grant_type": {"password"}, "client_id": {clientID}, "client_secret": {clientSecret}, "username": {userName}, "password": {password}})
+	fmt.Println("========================================================")
 
-	if err != nil {
-		log.Fatalf("Error: %#v\n", err)
+	done := make(chan bool)
+	tokch := make(chan string)
+	go tokGen(tokch, done)
+
+	out := make(chan diigoCsv)
+
+	var wg sync.WaitGroup
+	wg.Add(*concurrencyPtr)
+
+	for i := 0; i < *concurrencyPtr; i++ {
+		go func(i int) {
+			checkURLWorker(i, finvalid, in, out) // HLc
+			wg.Done()
+		}(i)
+	}
+	go func() {
+		wg.Wait()
+		close(out) // HLc
+	}()
+
+	result := make(chan diigoCsv) // result channel
+
+	var wg2 sync.WaitGroup
+	wg2.Add(*concurrencyPtr)
+
+	for i := 0; i < *concurrencyPtr; i++ {
+		go func(i int) {
+			insertURLWorker(i, finsert, tokch, out, result) // HLc
+			wg2.Done()
+		}(i)
+	}
+	go func() {
+		wg2.Wait()
+		close(result) // HLc
+	}()
+
+	// End of pipeline. OMIT
+
+	var workC int
+	for r := range result {
+
+		if r.insertResp == 200 {
+			workC++
+		}		
 	}
 
-	defer resp.Body.Close()
-
-	accessTokTime := time.Now().UnixNano()
-
-	var rd respData
-	byteData, err := ioutil.ReadAll(resp.Body)
-	json.Unmarshal(byteData, &rd)
+	done <- true
 
 	fmt.Println("========================================================")
 
-	sem := make(chan bool, *concurrencyPtr)
-
-	for _, s := range ds[1:] {
-		sem <- true
-
-		go checkURL(sem, s, rd.AccessToken, finvalid, finsert)
-
-		if ((time.Now().UnixNano() - accessTokTime) / 1000000000.0) > 3500 {
-			resp, err := http.PostForm(hostName+"/oauth/v2/token", url.Values{"grant_type": {"refresh_token"}, "client_id": {clientID}, "client_secret": {clientSecret}, "refresh_token": {rd.RefreshToken}})
-			if err != nil {
-				log.Fatalf("Error: %#v\n", err)
-			}
-			defer resp.Body.Close()
-
-			byteData, err := ioutil.ReadAll(resp.Body)
-			json.Unmarshal(byteData, &rd)
-		}
-
-	}
-	for i := 0; i < cap(sem); i++ {
-		sem <- true
-	}
-
-	fmt.Printf("Links OK: %d\n", workCounter)
+	fmt.Printf("Links OK: %d\n", workC)
 	fmt.Printf("\nDuration: %#.4v min.\n", float64((time.Now().UnixNano()-startTime)/1000000000.0)/60)
 }
 
-func retry(c http.Client, dc *diigoCsv) (resp *http.Response, err error) {
+func checkURLWorker(i int, finvalid *os.File, in <-chan diigoCsv, out chan<- diigoCsv) {
+	getClient := http.Client{
+		Timeout: time.Duration(5 * time.Second),
+	}
+
+	for diigo := range in {
+		resp, err := getClient.Get(diigo.url)
+		if err != nil || resp.StatusCode != 200 {
+			retry(getClient, &diigo, finvalid)
+		} else {
+			diigo.checkResp = resp.StatusCode
+		}
+		// fmt.Printf("CheckUrlWorker: %d, URL: %s, HttpCode: %d, Title: %s\n", i, diigo.url, diigo.httpResp, diigo.title)
+		out <- diigo
+	}
+}
+
+func insertURLWorker(i int, f *os.File, tch <-chan string, in <-chan diigoCsv, res chan<- diigoCsv) {
+	cPost := http.Client{
+		Timeout: time.Duration(1 * time.Minute),
+	}
+
+	for diigo := range in {
+		if diigo.checkResp == 200 {
+			form := url.Values{}
+			form.Add("url", diigo.url)
+			form.Add("title", diigo.title)
+			if diigo.tags != "no_tags" {
+				form.Add("tags", diigo.tags)
+			}
+			form.Add("content", diigo.description)
+			form.Add("published_at", diigo.createdAt)
+
+			req, err := http.NewRequest("POST", hostName+"/api/entries.json", strings.NewReader(form.Encode()))
+			if err != nil {
+				log.Fatalf("Error: %#v\n", err)
+			}
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			
+			token := <-tch
+			// fmt.Printf("InsertWorker: %d, Title: %s, Token:: %s\n", i, diigo.title, token)
+			req.Header.Set("Authorization", "Bearer "+token)
+
+			resp, err := cPost.Do(req)
+			if err != nil {
+				// log.Fatalf("Post Error: %s - %s\n", diigo.url, err)
+				f.WriteString(fmt.Sprintf("Post Error: %s - %s\n", diigo.url, err))
+			}
+
+			if resp != nil {
+				defer resp.Body.Close()
+
+				if resp.StatusCode != 200 {
+					f.WriteString(fmt.Sprintf("Warning: %d - %s\n", resp.StatusCode, diigo.url))
+				} else {
+					diigo.insertResp = 200
+				}
+			} else {
+				f.WriteString(fmt.Sprintf("Warning: No Response - %s\n", diigo.url))
+			}
+		}
+
+		diigo.workN = i
+		res <- diigo
+	}
+}
+
+func getToken() string {
+	var rd respData
+	resp, err := http.PostForm(hostName+"/oauth/v2/token",
+		url.Values{"grant_type": {"password"}, "client_id": {clientID}, "client_secret": {clientSecret}, "username": {userName}, "password": {password}})
+	if err != nil {
+		log.Fatalf("Error: %#v\n", err)
+	}
+	defer resp.Body.Close()
+
+	byteData, err := ioutil.ReadAll(resp.Body)
+	json.Unmarshal(byteData, &rd)
+
+	return rd.AccessToken
+}
+
+func tokGen(ch chan<- string, done <-chan bool) {
+	ticker := time.NewTicker(time.Second * 5)
+	defer ticker.Stop()
+
+	tok := getToken()
+
+	for {
+		select {
+		case <-done:
+			fmt.Println("Done!")
+			return
+		case ch <- tok:
+		case <-ticker.C:
+			tok = getToken()
+			fmt.Println("New TickerToken: ", tok)
+		}
+	}
+}
+
+func retry(c http.Client, dc *diigoCsv, f *os.File) {
 	for i := 0; i < 3; i++ {
-		resp, err = c.Get(dc.url)
+		resp, err := c.Get(dc.url)
 		if err == nil && resp.StatusCode == 200 {
-			return resp, err
+			dc.checkResp = resp.StatusCode
 		}
 		time.Sleep(1 * time.Microsecond)
 	}
 
 	ur, err := url.Parse(dc.url)
 	if err != nil {
-		log.Fatalf("Parse Error: %s\n", err)
+		dc.checkResp = 400
+		f.WriteString(fmt.Sprintf("Error: %s\n", err))
+		return
 	}
 
 	for i := 0; i < 3; i++ {
-		resp, err = c.Get(ur.Scheme + "://" + ur.Hostname())
+		resp, err := c.Get(ur.Scheme + "://" + ur.Hostname())
 		if err == nil && resp.StatusCode == 200 {
 			dc.url = ur.Scheme + "://" + ur.Hostname()
 			dc.title = ur.Hostname()
@@ -175,96 +291,42 @@ func retry(c http.Client, dc *diigoCsv) (resp *http.Response, err error) {
 			dc.description = ""
 			dc.comments = ""
 			dc.annotations = ""
-			return resp, err
+			dc.checkResp = 200
+			return
 		}
 		time.Sleep(1 * time.Microsecond)
 	}
-
-	return nil, errors.New("Could not connect to: " + dc.url + ", " + ur.Scheme + "://" + ur.Hostname())
+	f.WriteString(fmt.Sprintf("Error: %s\n", err))
+	dc.checkResp = 400
 }
 
-func checkURL(sem chan bool, u diigoCsv, token string, finvalid *os.File, finsert *os.File) {
-	defer func() { <-sem }()
-
-	getClient := http.Client{
-		Timeout: time.Duration(3 * time.Minute),
-	}
-
-	resp, err := getClient.Get(u.url)
-	if err != nil || resp.StatusCode != 200 {
-		resp, err = retry(getClient, &u)
-	}
-
-	if err != nil || resp.StatusCode != 200 {
-		finvalid.WriteString(fmt.Sprintf("Error: %s\n", err))
-		return
-	}
-
-	atomic.AddInt32(&workCounter, 1)
-	fmt.Printf("LINK: %d\n", workCounter)
-
-	form := url.Values{}
-	form.Add("url", u.url)
-	form.Add("title", u.title)
-	if u.tags != "no_tags" {
-		form.Add("tags", u.tags)
-	}
-	form.Add("content", u.description)
-	form.Add("published_at", u.createdAt)
-
-	req, err := http.NewRequest("POST", hostName+"/api/entries.json", strings.NewReader(form.Encode()))
-	if err != nil {
-		log.Fatalf("Error: %#v\n", err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	cPost := http.Client{
-		Timeout: time.Duration(10 * time.Minute),
-	}
-
-	resp, err = cPost.Do(req)
-	if err != nil {
-		finsert.WriteString(fmt.Sprintf("Post Error: %s - %s\n", u, err))
-		// log.Fatalf("Post Error: %s - %s\n", u, err)
-	}
-
-	if resp != nil {
-		defer resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			finsert.WriteString(fmt.Sprintf("Warning: %d - %s\n", resp.StatusCode, u.url))
-		}
-	} else {
-		finsert.WriteString(fmt.Sprintf("Warning: No Response - %s\n", u.url))
-	}
-}
-
-func createData(f *os.File) []diigoCsv {
+func genData(f *os.File) <-chan diigoCsv {
 	r := csv.NewReader(f)
+	out := make(chan diigoCsv)
 
-	ds := make([]diigoCsv, 0, 1000)
+	go func() {
+		for {
+			record, err := r.Read()
+			if err == io.EOF {
+				break
+			}
+			checkerr(err)
 
-	for {
-		record, err := r.Read()
-		if err == io.EOF {
-			break
+			s := diigoCsv{}
+			s.title = record[0]
+			s.url = record[1]
+			s.tags = record[2]
+			s.description = record[3]
+			s.comments = record[4]
+			s.annotations = record[5]
+			s.createdAt = record[6]
+
+			out <- s
 		}
-		checkerr(err)
+		close(out)
+	}()
 
-		s := diigoCsv{}
-		s.title = record[0]
-		s.url = record[1]
-		s.tags = record[2]
-		s.description = record[3]
-		s.comments = record[4]
-		s.annotations = record[5]
-		s.createdAt = record[6]
-
-		ds = append(ds, s)
-	}
-
-	return ds
+	return out
 }
 
 func checkerr(err error) {
