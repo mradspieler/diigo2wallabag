@@ -101,15 +101,14 @@ func main() {
 	}
 
 	in := genData(f)
-	fmt.Printf("Entries: %d\n", len(in))
-
+	
 	clientID = viper.GetString("settings.clientID")
 	clientSecret = viper.GetString("settings.clientSecret")
 	userName = viper.GetString("settings.username")
 	password = viper.GetString("settings.password")
 	hostName = viper.GetString("settings.host")
 
-	fmt.Println("========================================================")
+	fmt.Println("======================== Start Pipeline ========================")
 
 	done := make(chan bool)
 	tokch := make(chan string)
@@ -149,19 +148,22 @@ func main() {
 
 	// End of pipeline. OMIT
 
-	var workC int
+	var okC int
+	var allC int
 	for r := range result {
+		allC++
 
 		if r.insertResp == 200 {
-			workC++
+			okC++
 		}		
 	}
 
 	done <- true
 
-	fmt.Println("========================================================")
+	fmt.Println("======================== END Pipeline   ========================")
 
-	fmt.Printf("Links OK: %d\n", workC)
+	fmt.Printf("Links: %d\n", allC)
+	fmt.Printf("Links OK: %d\n", okC)
 	fmt.Printf("\nDuration: %#.4v min.\n", float64((time.Now().UnixNano()-startTime)/1000000000.0)/60)
 }
 
@@ -236,6 +238,7 @@ func getToken() string {
 	var rd respData
 	resp, err := http.PostForm(hostName+"/oauth/v2/token",
 		url.Values{"grant_type": {"password"}, "client_id": {clientID}, "client_secret": {clientSecret}, "username": {userName}, "password": {password}})
+	
 	if err != nil {
 		log.Fatalf("Error: %#v\n", err)
 	}
@@ -248,7 +251,7 @@ func getToken() string {
 }
 
 func tokGen(ch chan<- string, done <-chan bool) {
-	ticker := time.NewTicker(time.Second * 5)
+	ticker := time.NewTicker(time.Minute * 5)
 	defer ticker.Stop()
 
 	tok := getToken()
@@ -278,7 +281,7 @@ func retry(c http.Client, dc *diigoCsv, f *os.File) {
 	ur, err := url.Parse(dc.url)
 	if err != nil {
 		dc.checkResp = 400
-		f.WriteString(fmt.Sprintf("Error: %s\n", err))
+		f.WriteString(fmt.Sprintf("Error: %#v\n", err))
 		return
 	}
 
@@ -296,8 +299,8 @@ func retry(c http.Client, dc *diigoCsv, f *os.File) {
 		}
 		time.Sleep(1 * time.Microsecond)
 	}
-	f.WriteString(fmt.Sprintf("Error: %s\n", err))
 	dc.checkResp = 400
+	f.WriteString(fmt.Sprintf("Error: %#v\n", dc.url))
 }
 
 func genData(f *os.File) <-chan diigoCsv {
@@ -307,21 +310,24 @@ func genData(f *os.File) <-chan diigoCsv {
 	go func() {
 		for {
 			record, err := r.Read()
-			if err == io.EOF {
+
+			switch {
+			case err == io.EOF:
 				break
+			case record[1] == "url":
+				continue
+			default:
+				s := diigoCsv{}
+				s.title = record[0]
+				s.url = record[1]
+				s.tags = record[2]
+				s.description = record[3]
+				s.comments = record[4]
+				s.annotations = record[5]
+				s.createdAt = record[6]
+
+				out <- s
 			}
-			checkerr(err)
-
-			s := diigoCsv{}
-			s.title = record[0]
-			s.url = record[1]
-			s.tags = record[2]
-			s.description = record[3]
-			s.comments = record[4]
-			s.annotations = record[5]
-			s.createdAt = record[6]
-
-			out <- s
 		}
 		close(out)
 	}()
