@@ -28,9 +28,9 @@ type diigoCsv struct {
 	comments    string
 	annotations string
 	createdAt   string
-	checkResp    int
-	insertResp    int
-	workN    int
+	checkResp   int
+	insertResp  int
+	workN       int
 }
 
 type respData struct {
@@ -61,7 +61,7 @@ func initEnv() {
 }
 
 func main() {
-	
+
 	c, err := os.Create("cpu.pprof")
 	checkerr(err)
 	t, err := os.Create("trace.log")
@@ -79,9 +79,11 @@ func main() {
 
 	concurrencyPtr := flag.Int("t", 1, "how many goroutines startet")
 	debugPtr := flag.Bool("d", false, "write debug files")
+	proxyPtr := flag.String("p", "", "add a proxy")
 
 	flag.Parse()
 	args := flag.Args()
+
 	if len(args) < 1 {
 		log.Fatal("Please enter a csv")
 	}
@@ -91,6 +93,10 @@ func main() {
 	checkerr(err)
 	defer f.Close()
 
+	if *proxyPtr != "" {
+		os.Setenv("HTTP_PROXY", *proxyPtr)
+	}
+	
 	var finvalid, finsert *os.File
 
 	if *debugPtr {
@@ -187,7 +193,7 @@ func checkURLWorker(i int, finvalid *os.File, in <-chan diigoCsv, out chan<- dii
 
 func insertURLWorker(i int, f *os.File, tch <-chan string, in <-chan diigoCsv, res chan<- diigoCsv) {
 	cPost := http.Client{
-		Timeout: time.Duration(1 * time.Minute),
+		Timeout: time.Duration(5 * time.Minute),
 	}
 
 	for diigo := range in {
@@ -252,7 +258,7 @@ func getToken() string {
 }
 
 func tokGen(ch chan<- string, done <-chan bool) {
-	ticker := time.NewTicker(time.Minute * 5)
+	ticker := time.NewTicker(time.Minute * 45)
 	defer ticker.Stop()
 
 	tok := getToken()
