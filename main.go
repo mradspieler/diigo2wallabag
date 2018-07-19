@@ -61,6 +61,7 @@ func initEnv() {
 }
 
 func main() {
+	
 	c, err := os.Create("cpu.pprof")
 	checkerr(err)
 	t, err := os.Create("trace.log")
@@ -308,12 +309,14 @@ func genData(f *os.File) <-chan diigoCsv {
 	out := make(chan diigoCsv)
 
 	go func() {
+
+		loop:
 		for {
 			record, err := r.Read()
 
 			switch {
 			case err == io.EOF:
-				break
+				break loop
 			case record[1] == "url":
 				continue
 			default:
