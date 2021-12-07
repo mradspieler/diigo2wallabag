@@ -1,3 +1,5 @@
+![build workflow](https://github.com/mradspieler/diigo2wallabag/actions/workflows/build.yml/badge.svg)
+
 # diigo to wallabag converter
 A Go program for importing a diigo csv file into wallabag.
 
